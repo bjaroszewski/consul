@@ -2,10 +2,10 @@ package state
 
 import (
 	"fmt"
-	"sort"
-
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/go-memdb"
+	"net/url"
+	"sort"
 )
 
 const (
@@ -30,7 +30,7 @@ func intentionsTableSchema() *memdb.TableSchema {
 				Name:         "destination",
 				AllowMissing: true,
 				// This index is not unique since we need uniqueness across the whole
-				// 4-tuple.
+				// 5-tuple.
 				Unique: false,
 				Indexer: &memdb.CompoundIndex{
 					Indexes: []memdb.Indexer{
@@ -49,10 +49,14 @@ func intentionsTableSchema() *memdb.TableSchema {
 				Name:         "source",
 				AllowMissing: true,
 				// This index is not unique since we need uniqueness across the whole
-				// 4-tuple.
+				// 5-tuple.
 				Unique: false,
 				Indexer: &memdb.CompoundIndex{
 					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field:     "SourceType",
+							Lowercase: true,
+						},
 						&memdb.StringFieldIndex{
 							Field:     "SourceNS",
 							Lowercase: true,
@@ -70,6 +74,10 @@ func intentionsTableSchema() *memdb.TableSchema {
 				Unique:       true,
 				Indexer: &memdb.CompoundIndex{
 					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field:     "SourceType",
+							Lowercase: true,
+						},
 						&memdb.StringFieldIndex{
 							Field:     "SourceNS",
 							Lowercase: true,
@@ -193,9 +201,9 @@ func (s *Store) intentionSetTxn(tx *memdb.Txn, idx uint64, ixn *structs.Intentio
 	}
 	ixn.ModifyIndex = idx
 
-	// Check for duplicates on the 4-tuple.
+	// Check for duplicates on the 5-tuple.
 	duplicate, err := tx.First(intentionsTableName, "source_destination",
-		ixn.SourceNS, ixn.SourceName, ixn.DestinationNS, ixn.DestinationName)
+		string(ixn.SourceType), ixn.SourceNS, ixn.SourceName, ixn.DestinationNS, ixn.DestinationName)
 	if err != nil {
 		return fmt.Errorf("failed intention lookup: %s", err)
 	}
@@ -313,7 +321,7 @@ func (s *Store) IntentionMatch(ws memdb.WatchSet, args *structs.IntentionQueryMa
 		// this is not the most optimal set of queries since we repeat some
 		// many times (such as */*). We can work on improving that in the
 		// future, the test cases shouldn't have to change for that.
-		getParams, err := s.intentionMatchGetParams(entry)
+		getParams, err := s.intentionMatchGetParams(args.Type, args.SourceType, entry)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -333,6 +341,32 @@ func (s *Store) IntentionMatch(ws memdb.WatchSet, args *structs.IntentionQueryMa
 			}
 		}
 
+		// If matching an external uri, in addition to the exact match done
+		// above, we also need to check if the uri's domain matches against
+		// any external trust domain intentions. e.g. spiffe://host/path will
+		// match against a trust domain intention with source spiffe://host.
+		if args.Type == structs.IntentionMatchSource && args.SourceType == structs.IntentionSourceExternalURI {
+			uri, err := url.Parse(entry.Name)
+			// If there's an error then nothing will match this url anyway so
+			// we don't search further.
+			if err == nil {
+				params := []interface{}{
+					string(structs.IntentionSourceExternalTrustDomain),
+					entry.Namespace,
+					fmt.Sprintf("%s://%s", uri.Scheme, uri.Hostname())}
+				iter, err := tx.Get(intentionsTableName, string(args.Type), params...)
+				if err != nil {
+					return 0, nil, fmt.Errorf("failed intention lookup: %s", err)
+				}
+
+				ws.Add(iter.WatchCh())
+
+				for ixn := iter.Next(); ixn != nil; ixn = iter.Next() {
+					ixns = append(ixns, ixn.(*structs.Intention))
+				}
+			}
+		}
+
 		// Sort the results by precedence
 		sort.Sort(structs.IntentionPrecedenceSorter(ixns))
 
@@ -345,22 +379,40 @@ func (s *Store) IntentionMatch(ws memdb.WatchSet, args *structs.IntentionQueryMa
 
 // intentionMatchGetParams returns the tx.Get parameters to find all the
 // intentions for a certain entry.
-func (s *Store) intentionMatchGetParams(entry structs.IntentionMatchEntry) ([][]interface{}, error) {
-	// We always query for "*/*" so include that. If the namespace is a
-	// wildcard, then we're actually done.
-	result := make([][]interface{}, 0, 3)
-	result = append(result, []interface{}{"*", "*"})
-	if entry.Namespace == structs.IntentionWildcard {
-		return result, nil
+func (s *Store) intentionMatchGetParams(matchType structs.IntentionMatchType,
+	srcType structs.IntentionSourceType, entry structs.IntentionMatchEntry) ([][]interface{}, error) {
+
+	dstGetParams := func() [][]interface{} {
+		// We always query for "*/*" so include that. If the namespace is a
+		// wildcard, then we're actually done.
+		result := make([][]interface{}, 0, 3)
+		result = append(result, []interface{}{"*", "*"})
+		if entry.Namespace == structs.IntentionWildcard {
+			return result
+		}
+
+		// Search for NS/* intentions. If we have a wildcard name, then we're done.
+		result = append(result, []interface{}{entry.Namespace, "*"})
+		if entry.Name == structs.IntentionWildcard {
+			return result
+		}
+
+		// Search for the exact NS/N value.
+		result = append(result, []interface{}{entry.Namespace, entry.Name})
+		return result
+	}()
+
+	// The destination table has index (DestinationNS, DestinationName)
+	// so we're done here.
+	if matchType == structs.IntentionMatchDestination {
+		return dstGetParams, nil
 	}
 
-	// Search for NS/* intentions. If we have a wildcard name, then we're done.
-	result = append(result, []interface{}{entry.Namespace, "*"})
-	if entry.Name == structs.IntentionWildcard {
-		return result, nil
+	// We need to add SourceType if querying the source table since
+	// its index is (SourceType, SourceNS, SourceName).
+	var result [][]interface{}
+	for _, e := range dstGetParams {
+		result = append(result, []interface{}{string(srcType), e[0], e[1]})
 	}
-
-	// Search for the exact NS/N value.
-	result = append(result, []interface{}{entry.Namespace, entry.Name})
 	return result, nil
 }

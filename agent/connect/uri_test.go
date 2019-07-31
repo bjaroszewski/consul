@@ -65,6 +65,16 @@ var testCertURICases = []struct {
 		},
 		"",
 	},
+
+	{
+		"external service id",
+		"spiffe://external-trust.domain/workload",
+		&SpiffeIDExternalService{
+			Host: "external-trust.domain",
+			Path: "/workload",
+		},
+		"",
+	},
 }
 
 func TestParseCertURIFromString(t *testing.T) {

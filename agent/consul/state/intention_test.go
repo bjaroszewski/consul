@@ -34,6 +34,7 @@ func TestStore_IntentionSetGet_basic(t *testing.T) {
 	// Build a valid intention
 	ixn := &structs.Intention{
 		ID:              testUUID(),
+		SourceType:      structs.IntentionSourceConsul,
 		SourceNS:        "default",
 		SourceName:      "*",
 		DestinationNS:   "default",
@@ -51,6 +52,7 @@ func TestStore_IntentionSetGet_basic(t *testing.T) {
 	// Read it back out and verify it.
 	expected := &structs.Intention{
 		ID:              ixn.ID,
+		SourceType:      structs.IntentionSourceConsul,
 		SourceNS:        "default",
 		SourceName:      "*",
 		DestinationNS:   "default",
@@ -92,9 +94,10 @@ func TestStore_IntentionSetGet_basic(t *testing.T) {
 	assert.Equal(expected.ModifyIndex, idx)
 	assert.Equal(expected, actual)
 
-	// Attempt to insert another intention with duplicate 4-tuple
+	// Attempt to insert another intention with duplicate 5-tuple
 	ixn = &structs.Intention{
 		ID:              testUUID(),
+		SourceType:      structs.IntentionSourceConsul,
 		SourceNS:        "default",
 		SourceName:      "*",
 		DestinationNS:   "default",
@@ -102,7 +105,7 @@ func TestStore_IntentionSetGet_basic(t *testing.T) {
 		Meta:            map[string]string{},
 	}
 
-	// Duplicate 4-tuple should cause an error
+	// Duplicate 5-tuple should cause an error
 	ws = memdb.NewWatchSet()
 	assert.Error(s.IntentionSet(3, ixn))
 
@@ -388,6 +391,7 @@ func TestStore_IntentionMatch_table(t *testing.T) {
 					ixn.SourceName = v[3]
 				}
 			case structs.IntentionMatchSource:
+				ixn.SourceType = structs.IntentionSourceConsul
 				ixn.SourceNS = v[0]
 				ixn.SourceName = v[1]
 				if len(v) == 4 {
@@ -402,7 +406,7 @@ func TestStore_IntentionMatch_table(t *testing.T) {
 		}
 
 		// Build the arguments
-		args := &structs.IntentionQueryMatch{Type: typ}
+		args := &structs.IntentionQueryMatch{Type: typ, SourceType: structs.IntentionSourceConsul}
 		for _, q := range tc.Query {
 			args.Entries = append(args.Entries, structs.IntentionMatchEntry{
 				Namespace: q[0],

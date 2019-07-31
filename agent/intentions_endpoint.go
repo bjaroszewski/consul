@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"github.com/hashicorp/consul/api"
 	"net/http"
 	"strings"
 
@@ -82,6 +83,29 @@ func (s *HTTPServer) IntentionMatch(resp http.ResponseWriter, req *http.Request)
 		default:
 			return nil, fmt.Errorf("'by' parameter must be one of 'source' or 'destination'")
 		}
+	}
+
+	// Extract the source type query parameter if this is a source match.
+	if args.Match.Type == structs.IntentionMatchSource {
+		srcTypes, ok := q["source-type"]
+		if len(srcTypes) > 1 {
+			return nil, fmt.Errorf("can only specify 'source-type' parameter once")
+		}
+
+		// Source type defaults to consul.
+		srcType := string(structs.IntentionSourceConsul)
+		if ok {
+			srcType = srcTypes[0]
+			switch structs.IntentionSourceType(srcType) {
+			case structs.IntentionSourceConsul,
+				structs.IntentionSourceExternalTrustDomain,
+				structs.IntentionSourceExternalURI:
+			default:
+				return nil, fmt.Errorf("'source-type' parameter must be %q, %q or %q",
+					structs.IntentionSourceConsul, api.IntentionSourceExternalTrustDomain, api.IntentionSourceExternalURI)
+			}
+		}
+		args.Match.SourceType = structs.IntentionSourceType(srcType)
 	}
 
 	// Extract all the match names
@@ -289,6 +313,11 @@ type intentionCreateResponse struct{ ID string }
 func parseIntentionMatchEntry(input string) (structs.IntentionMatchEntry, error) {
 	var result structs.IntentionMatchEntry
 	result.Namespace = structs.IntentionDefaultNamespace
+
+	if strings.HasPrefix(input, "spiffe://") {
+		result.Name = input
+		return result, nil
+	}
 
 	// TODO(mitchellh): when namespaces are introduced, set the default
 	// namespace to be the namespace of the requestor.
